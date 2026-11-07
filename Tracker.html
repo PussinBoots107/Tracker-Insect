@@ -1,0 +1,1439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IK Creature Simulation</title>
+
+<style>
+    * {
+        box-sizing: border-box;
+    }
+
+    html, body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #07090d;
+    }
+
+    body {
+        font-family: monospace;
+    }
+
+    canvas {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+        cursor: crosshair;
+    }
+
+    .hud {
+        position: fixed;
+        top: 18px;
+        left: 20px;
+        color: rgba(180, 220, 255, 0.55);
+        font-size: 11px;
+        letter-spacing: 1px;
+        pointer-events: none;
+        user-select: none;
+    }
+</style>
+</head>
+
+<body>
+
+<canvas id="canvas"></canvas>
+
+<div class="hud">
+    IK CREATURE // MOVE CURSOR // CLICK TO PULSE
+</div>
+
+<script>
+"use strict";
+
+/* =========================================================
+   CANVAS
+========================================================= */
+
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+
+let W = window.innerWidth;
+let H = window.innerHeight;
+let DPR = Math.min(window.devicePixelRatio || 1, 2);
+
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+
+    canvas.width = W * DPR;
+    canvas.height = H * DPR;
+
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+
+window.addEventListener("resize", resize);
+resize();
+
+
+/* =========================================================
+   MATH HELPERS
+========================================================= */
+
+const TAU = Math.PI * 2;
+
+function clamp(v, min, max) {
+    return Math.max(min, Math.min(max, v));
+}
+
+function lerp(a, b, t) {
+    return a + (b - a) * t;
+}
+
+function lerpAngle(a, b, t) {
+    let d = ((b - a + Math.PI) % TAU) - Math.PI;
+    return a + d * t;
+}
+
+function dist(a, b) {
+    return Math.hypot(b.x - a.x, b.y - a.y);
+}
+
+function angle(a, b) {
+    return Math.atan2(b.y - a.y, b.x - a.x);
+}
+
+function pointAt(p, ang, length) {
+    return {
+        x: p.x + Math.cos(ang) * length,
+        y: p.y + Math.sin(ang) * length
+    };
+}
+
+function normalize(x, y) {
+    const d = Math.hypot(x, y) || 1;
+    return {
+        x: x / d,
+        y: y / d
+    };
+}
+
+function easeInOut(t) {
+    return t < 0.5
+        ? 2 * t * t
+        : 1 - Math.pow(-2 * t + 2, 2) / 2;
+}
+
+
+/* =========================================================
+   MOUSE
+========================================================= */
+
+const mouse = {
+    x: W * 0.65,
+    y: H * 0.5,
+    active: false,
+    pulse: 0
+};
+
+canvas.addEventListener("mousemove", e => {
+    mouse.x = e.clientX;
+    mouse.y = e.clientY;
+    mouse.active = true;
+});
+
+canvas.addEventListener("mouseleave", () => {
+    mouse.active = false;
+});
+
+canvas.addEventListener("click", () => {
+    mouse.pulse = 1;
+
+    /*
+       Clicking slightly changes the creature's
+       current locomotion impulse.
+    */
+    creature.speedBoost = 1;
+});
+
+
+/* =========================================================
+   POINT / SPINE
+========================================================= */
+
+class Point {
+    constructor(x, y) {
+        this.x = x;
+        this.y = y;
+
+        this.px = x;
+        this.py = y;
+    }
+
+    updateVelocity() {
+        this.px = this.x;
+        this.py = this.y;
+    }
+}
+
+
+/* =========================================================
+   CREATURE
+========================================================= */
+
+class Creature {
+
+    constructor() {
+
+        this.segmentCount = 30;
+        this.segmentLength = 17;
+
+        this.spine = [];
+
+        this.head = {
+            x: W * 0.5,
+            y: H * 0.5,
+            angle: 0,
+            speed: 2.5
+        };
+
+        this.speedBoost = 0;
+
+        /*
+            Create spine.
+        */
+        for (let i = 0; i < this.segmentCount; i++) {
+
+            const x =
+                this.head.x -
+                i * this.segmentLength;
+
+            this.spine.push(
+                new Point(x, this.head.y)
+            );
+        }
+
+
+        /*
+            Leg configuration.
+        */
+        this.legs = [];
+
+        const legPairs = 9;
+
+        for (let i = 0; i < legPairs; i++) {
+
+            /*
+                Avoid putting legs directly on the head.
+            */
+            const spineIndex =
+                3 + i * 3;
+
+            if (spineIndex >= this.segmentCount - 2)
+                break;
+
+            /*
+                Alternate sides.
+            */
+            for (let side of [-1, 1]) {
+
+                this.legs.push(
+                    new Leg(
+                        spineIndex,
+                        side,
+                        this
+                    )
+                );
+            }
+        }
+
+
+        /*
+            Antennae state.
+        */
+        this.antennae = [
+            {
+                side: -1,
+                phase: 0
+            },
+            {
+                side: 1,
+                phase: Math.PI
+            }
+        ];
+
+        this.time = 0;
+    }
+
+
+    /* -----------------------------------------------------
+       UPDATE
+    ----------------------------------------------------- */
+
+    update(dt) {
+
+        this.time += dt;
+
+        /*
+            Mouse target.
+        */
+        const target = mouse.active
+            ? mouse
+            : {
+                x: W * 0.5 + Math.cos(this.time * 0.4) * 180,
+                y: H * 0.5 + Math.sin(this.time * 0.55) * 100
+            };
+
+
+        /*
+            Head tracks cursor.
+        */
+        const desiredAngle =
+            Math.atan2(
+                target.y - this.head.y,
+                target.x - this.head.x
+            );
+
+        this.head.angle =
+            lerpAngle(
+                this.head.angle,
+                desiredAngle,
+                0.08
+            );
+
+
+        /*
+            Head movement.
+            The creature continuously advances toward
+            the cursor rather than teleporting to it.
+        */
+        const d =
+            Math.hypot(
+                target.x - this.head.x,
+                target.y - this.head.y
+            );
+
+        const movement =
+            clamp(d * 0.015, 0.5, 2.7)
+            + this.speedBoost;
+
+        this.head.x +=
+            Math.cos(this.head.angle) * movement;
+
+        this.head.y +=
+            Math.sin(this.head.angle) * movement;
+
+
+        /*
+            Keep head on screen.
+        */
+        const margin = 70;
+
+        if (this.head.x < margin)
+            this.head.x = margin;
+
+        if (this.head.x > W - margin)
+            this.head.x = W - margin;
+
+        if (this.head.y < margin)
+            this.head.y = margin;
+
+        if (this.head.y > H - margin)
+            this.head.y = H - margin;
+
+
+        this.speedBoost *= 0.94;
+
+
+        /*
+            Head becomes first spine point.
+        */
+        this.spine[0].x = this.head.x;
+        this.spine[0].y = this.head.y;
+
+
+        /*
+            Solve chained distance constraints.
+        */
+        this.solveSpine();
+
+
+        /*
+            Update legs.
+        */
+        for (const leg of this.legs) {
+            leg.update(dt);
+        }
+
+
+        /*
+            Pulse decay.
+        */
+        mouse.pulse *= 0.93;
+    }
+
+
+    /* -----------------------------------------------------
+       SPINE IK / DISTANCE CONSTRAINTS
+    ----------------------------------------------------- */
+
+    solveSpine() {
+
+        /*
+            Forward constraint pass.
+
+            Each segment tries to remain exactly
+            segmentLength away from its parent.
+        */
+        for (let i = 1; i < this.spine.length; i++) {
+
+            const parent = this.spine[i - 1];
+            const current = this.spine[i];
+
+            const dx = current.x - parent.x;
+            const dy = current.y - parent.y;
+
+            const d = Math.hypot(dx, dy) || 1;
+
+            const ratio =
+                this.segmentLength / d;
+
+            current.x =
+                parent.x + dx * ratio;
+
+            current.y =
+                parent.y + dy * ratio;
+        }
+
+
+        /*
+            A small backward relaxation pass gives
+            the chain more organic movement.
+        */
+        for (let i = this.spine.length - 2; i >= 1; i--) {
+
+            const child = this.spine[i + 1];
+            const current = this.spine[i];
+
+            const dx = current.x - child.x;
+            const dy = current.y - child.y;
+
+            const d = Math.hypot(dx, dy) || 1;
+
+            const ratio =
+                this.segmentLength / d;
+
+            current.x =
+                child.x + dx * ratio;
+
+            current.y =
+                child.y + dy * ratio;
+        }
+
+
+        /*
+            Restore head position after backward pass.
+        */
+        this.spine[0].x = this.head.x;
+        this.spine[0].y = this.head.y;
+
+
+        /*
+            A couple of additional forward passes
+            smooth out the chain.
+        */
+        for (let pass = 0; pass < 2; pass++) {
+
+            for (let i = 1; i < this.spine.length; i++) {
+
+                const p = this.spine[i - 1];
+                const c = this.spine[i];
+
+                const dx = c.x - p.x;
+                const dy = c.y - p.y;
+
+                const d = Math.hypot(dx, dy) || 1;
+
+                c.x =
+                    p.x + dx / d * this.segmentLength;
+
+                c.y =
+                    p.y + dy / d * this.segmentLength;
+            }
+        }
+    }
+
+
+    /* -----------------------------------------------------
+       DRAW
+    ----------------------------------------------------- */
+
+    draw() {
+
+        this.drawLegs();
+        this.drawSpine();
+        this.drawHead();
+        this.drawAntennae();
+    }
+
+
+    /* -----------------------------------------------------
+       SPINE DRAWING
+    ----------------------------------------------------- */
+
+    drawSpine() {
+
+        /*
+            Main spine.
+        */
+        ctx.beginPath();
+
+        ctx.moveTo(
+            this.spine[0].x,
+            this.spine[0].y
+        );
+
+        for (let i = 1; i < this.spine.length; i++) {
+
+            ctx.lineTo(
+                this.spine[i].x,
+                this.spine[i].y
+            );
+        }
+
+        ctx.strokeStyle =
+            "rgba(185, 220, 245, 0.85)";
+
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+
+        /*
+            Vertebrae / rib-like crossbars.
+        */
+        for (
+            let i = 2;
+            i < this.spine.length - 1;
+            i += 2
+        ) {
+
+            const p = this.spine[i - 1];
+            const c = this.spine[i + 1];
+
+            const tangent =
+                normalize(
+                    c.x - p.x,
+                    c.y - p.y
+                );
+
+            const normal = {
+                x: -tangent.y,
+                y: tangent.x
+            };
+
+
+            /*
+                Body gradually becomes narrower.
+            */
+            const width =
+                lerp(
+                    12,
+                    4,
+                    i / this.spine.length
+                );
+
+
+            const left = {
+                x: this.spine[i].x + normal.x * width,
+                y: this.spine[i].y + normal.y * width
+            };
+
+            const right = {
+                x: this.spine[i].x - normal.x * width,
+                y: this.spine[i].y - normal.y * width
+            };
+
+
+            ctx.beginPath();
+
+            ctx.moveTo(left.x, left.y);
+            ctx.lineTo(right.x, right.y);
+
+            ctx.strokeStyle =
+                "rgba(125, 180, 210, 0.55)";
+
+            ctx.lineWidth = 1;
+            ctx.stroke();
+        }
+
+
+        /*
+            Segment joints.
+        */
+        for (let i = 0; i < this.spine.length; i++) {
+
+            const p = this.spine[i];
+
+            const radius =
+                i === 0
+                    ? 5
+                    : lerp(3.5, 1.5, i / this.spine.length);
+
+            ctx.beginPath();
+
+            ctx.arc(
+                p.x,
+                p.y,
+                radius,
+                0,
+                TAU
+            );
+
+            ctx.fillStyle =
+                "rgba(190, 225, 245, 0.9)";
+
+            ctx.fill();
+        }
+    }
+
+
+    /* -----------------------------------------------------
+       HEAD
+    ----------------------------------------------------- */
+
+    drawHead() {
+
+        const h = this.head;
+
+        /*
+            Skull-like wireframe.
+        */
+        const front = pointAt(
+            h,
+            h.angle,
+            15
+        );
+
+        const back = pointAt(
+            h,
+            h.angle + Math.PI,
+            9
+        );
+
+        const normal = {
+            x: -Math.sin(h.angle),
+            y: Math.cos(h.angle)
+        };
+
+        const left = {
+            x: front.x + normal.x * 7,
+            y: front.y + normal.y * 7
+        };
+
+        const right = {
+            x: front.x - normal.x * 7,
+            y: front.y - normal.y * 7
+        };
+
+
+        ctx.beginPath();
+
+        ctx.moveTo(back.x, back.y);
+        ctx.lineTo(left.x, left.y);
+        ctx.lineTo(front.x, front.y);
+        ctx.lineTo(right.x, right.y);
+        ctx.closePath();
+
+        ctx.strokeStyle =
+            "rgba(220, 240, 255, 0.95)";
+
+        ctx.lineWidth = 2;
+
+        ctx.stroke();
+
+
+        /*
+            Eye.
+        */
+        const eye =
+            pointAt(
+                h,
+                h.angle,
+                9
+            );
+
+        ctx.beginPath();
+
+        ctx.arc(
+            eye.x,
+            eye.y,
+            2,
+            0,
+            TAU
+        );
+
+        ctx.fillStyle =
+            "#d9f4ff";
+
+        ctx.fill();
+
+
+        /*
+            Pulse ring after clicking.
+        */
+        if (mouse.pulse > 0.01) {
+
+            ctx.beginPath();
+
+            ctx.arc(
+                h.x,
+                h.y,
+                15 + (1 - mouse.pulse) * 35,
+                0,
+                TAU
+            );
+
+            ctx.strokeStyle =
+                `rgba(150, 220, 255, ${mouse.pulse * 0.4})`;
+
+            ctx.lineWidth = 1;
+
+            ctx.stroke();
+        }
+    }
+
+
+    /* -----------------------------------------------------
+       ANTENNAE
+    ----------------------------------------------------- */
+
+    drawAntennae() {
+
+        const head = this.head;
+
+        for (const antenna of this.antennae) {
+
+            const side = antenna.side;
+
+            const baseAngle =
+                head.angle +
+                side * 0.55;
+
+            const wave =
+                Math.sin(
+                    this.time * 3 +
+                    antenna.phase
+                ) * 0.12;
+
+            const a1 =
+                pointAt(
+                    head,
+                    baseAngle + wave,
+                    18
+                );
+
+            const a2 =
+                pointAt(
+                    a1,
+                    baseAngle + side * 0.2 + wave,
+                    23
+                );
+
+            ctx.beginPath();
+
+            ctx.moveTo(head.x, head.y);
+            ctx.lineTo(a1.x, a1.y);
+            ctx.lineTo(a2.x, a2.y);
+
+            ctx.strokeStyle =
+                "rgba(175, 220, 240, 0.8)";
+
+            ctx.lineWidth = 1.4;
+
+            ctx.stroke();
+
+
+            ctx.beginPath();
+
+            ctx.arc(
+                a2.x,
+                a2.y,
+                2,
+                0,
+                TAU
+            );
+
+            ctx.fillStyle =
+                "rgba(210, 240, 255, 0.9)";
+
+            ctx.fill();
+        }
+    }
+
+
+    /* -----------------------------------------------------
+       LEGS
+    ----------------------------------------------------- */
+
+    drawLegs() {
+
+        /*
+            Draw each leg behind the spine.
+        */
+        for (const leg of this.legs) {
+            leg.draw();
+        }
+    }
+}
+
+
+/* =========================================================
+   PROCEDURAL LEG
+========================================================= */
+
+class Leg {
+
+    constructor(spineIndex, side, creature) {
+
+        this.creature = creature;
+
+        this.spineIndex = spineIndex;
+        this.side = side;
+
+        /*
+            Upper and lower segment lengths.
+        */
+        this.upperLength = 14;
+        this.lowerLength = 18;
+
+        /*
+            Foot position.
+        */
+        this.foot = {
+            x: 0,
+            y: 0
+        };
+
+        this.target = {
+            x: 0,
+            y: 0
+        };
+
+        this.start = {
+            x: 0,
+            y: 0
+        };
+
+        this.progress = 1;
+
+        /*
+            Slightly different stepping rhythm
+            for each leg.
+        */
+        this.phase =
+            spineIndex * 0.45 +
+            (side === 1 ? 0 : Math.PI);
+
+        this.stepDuration = 0.28;
+
+        this.initialize();
+    }
+
+
+    initialize() {
+
+        const anchor =
+            this.getAnchor();
+
+        const target =
+            this.calculateTarget();
+
+        this.foot.x = target.x;
+        this.foot.y = target.y;
+
+        this.target.x = target.x;
+        this.target.y = target.y;
+
+        this.start.x = target.x;
+        this.start.y = target.y;
+    }
+
+
+    /* -----------------------------------------------------
+       BODY ATTACHMENT
+    ----------------------------------------------------- */
+
+    getAnchor() {
+
+        return this.creature.spine[
+            this.spineIndex
+        ];
+    }
+
+
+    /* -----------------------------------------------------
+       CALCULATE IDEAL FOOT POSITION
+    ----------------------------------------------------- */
+
+    calculateTarget() {
+
+        const spine =
+            this.creature.spine;
+
+        const p =
+            spine[this.spineIndex];
+
+        const prev =
+            spine[
+                Math.max(0, this.spineIndex - 1)
+            ];
+
+        const next =
+            spine[
+                Math.min(
+                    spine.length - 1,
+                    this.spineIndex + 1
+                )
+            ];
+
+
+        /*
+            Tangent along body.
+        */
+        const tangent =
+            normalize(
+                next.x - prev.x,
+                next.y - prev.y
+            );
+
+
+        /*
+            Normal points sideways.
+        */
+        const normal = {
+            x: -tangent.y,
+            y: tangent.x
+        };
+
+
+        /*
+            Legs point outward and slightly forward.
+        */
+        const forwardOffset =
+            17;
+
+        const sideOffset =
+            23;
+
+
+        return {
+            x:
+                p.x +
+                normal.x * sideOffset * this.side +
+                tangent.x * forwardOffset,
+
+            y:
+                p.y +
+                normal.y * sideOffset * this.side +
+                tangent.y * forwardOffset
+        };
+    }
+
+
+    /* -----------------------------------------------------
+       LEG UPDATE
+    ----------------------------------------------------- */
+
+    update(dt) {
+
+        const ideal =
+            this.calculateTarget();
+
+        const distance =
+            Math.hypot(
+                this.foot.x - ideal.x,
+                this.foot.y - ideal.y
+            );
+
+
+        /*
+            Maximum comfortable foot displacement.
+        */
+        const maxDistance = 27;
+
+
+        /*
+            Start a new step if the foot has
+            fallen too far behind.
+        */
+        if (
+            this.progress >= 1 &&
+            distance > maxDistance
+        ) {
+
+            this.start.x = this.foot.x;
+            this.start.y = this.foot.y;
+
+            this.target.x = ideal.x;
+            this.target.y = ideal.y;
+
+            this.progress = 0;
+        }
+
+
+        /*
+            Step interpolation.
+        */
+        if (this.progress < 1) {
+
+            this.progress +=
+                dt / this.stepDuration;
+
+            const t =
+                clamp(this.progress, 0, 1);
+
+            const e =
+                easeInOut(t);
+
+
+            /*
+                Horizontal movement.
+            */
+            this.foot.x =
+                lerp(
+                    this.start.x,
+                    this.target.x,
+                    e
+                );
+
+            this.foot.y =
+                lerp(
+                    this.start.y,
+                    this.target.y,
+                    e
+                );
+
+
+            /*
+                Lift the foot in an arc.
+            */
+            const lift =
+                Math.sin(t * Math.PI) * 10;
+
+            /*
+                Direction perpendicular to
+                the stepping direction.
+            */
+            const dx =
+                this.target.x - this.start.x;
+
+            const dy =
+                this.target.y - this.start.y;
+
+            const length =
+                Math.hypot(dx, dy) || 1;
+
+            /*
+                Lift mostly vertically on screen.
+            */
+            this.foot.y -= lift;
+        }
+    }
+
+
+    /* -----------------------------------------------------
+       TWO-BONE IK
+    ----------------------------------------------------- */
+
+    solveIK(anchor, foot) {
+
+        const dx =
+            foot.x - anchor.x;
+
+        const dy =
+            foot.y - anchor.y;
+
+        const distanceToFoot =
+            Math.hypot(dx, dy);
+
+
+        /*
+            Clamp target so the leg cannot become
+            physically impossible.
+        */
+        const maxReach =
+            this.upperLength +
+            this.lowerLength -
+            0.5;
+
+        const minReach =
+            Math.abs(
+                this.upperLength -
+                this.lowerLength
+            ) + 0.5;
+
+        const d =
+            clamp(
+                distanceToFoot,
+                minReach,
+                maxReach
+            );
+
+
+        const baseAngle =
+            Math.atan2(dy, dx);
+
+
+        /*
+            Law of cosines:
+            upper² + d² - lower²
+            ---------------------
+                  2 * upper * d
+        */
+        const cosAngle =
+            clamp(
+                (
+                    this.upperLength ** 2 +
+                    d ** 2 -
+                    this.lowerLength ** 2
+                ) /
+                (
+                    2 *
+                    this.upperLength *
+                    d
+                ),
+                -1,
+                1
+            );
+
+
+        const bend =
+            Math.acos(cosAngle);
+
+
+        /*
+            Bend direction depends on which side
+            of the creature the leg occupies.
+        */
+        const kneeAngle =
+            baseAngle +
+            bend * this.side;
+
+
+        const knee = {
+            x:
+                anchor.x +
+                Math.cos(kneeAngle) *
+                this.upperLength,
+
+            y:
+                anchor.y +
+                Math.sin(kneeAngle) *
+                this.upperLength
+        };
+
+
+        return {
+            knee,
+            foot
+        };
+    }
+
+
+    /* -----------------------------------------------------
+       DRAW
+    ----------------------------------------------------- */
+
+    draw() {
+
+        const anchor =
+            this.getAnchor();
+
+        const ik =
+            this.solveIK(
+                anchor,
+                this.foot
+            );
+
+        const knee =
+            ik.knee;
+
+        const foot =
+            ik.foot;
+
+
+        /*
+            Upper limb.
+        */
+        ctx.beginPath();
+
+        ctx.moveTo(
+            anchor.x,
+            anchor.y
+        );
+
+        ctx.lineTo(
+            knee.x,
+            knee.y
+        );
+
+        ctx.lineTo(
+            foot.x,
+            foot.y
+        );
+
+        ctx.strokeStyle =
+            "rgba(135, 190, 220, 0.75)";
+
+        ctx.lineWidth = 1.7;
+
+        ctx.stroke();
+
+
+        /*
+            Knee joint.
+        */
+        ctx.beginPath();
+
+        ctx.arc(
+            knee.x,
+            knee.y,
+            3,
+            0,
+            TAU
+        );
+
+        ctx.strokeStyle =
+            "rgba(160, 210, 235, 0.8)";
+
+        ctx.lineWidth = 1;
+
+        ctx.stroke();
+
+
+        /*
+            Foot claw / endpoint.
+        */
+        const footAngle =
+            Math.atan2(
+                foot.y - knee.y,
+                foot.x - knee.x
+            );
+
+
+        for (let i = -1; i <= 1; i++) {
+
+            const clawAngle =
+                footAngle +
+                i * 0.35;
+
+            const claw =
+                pointAt(
+                    foot,
+                    clawAngle,
+                    6
+                );
+
+            ctx.beginPath();
+
+            ctx.moveTo(
+                foot.x,
+                foot.y
+            );
+
+            ctx.lineTo(
+                claw.x,
+                claw.y
+            );
+
+            ctx.strokeStyle =
+                "rgba(170, 215, 235, 0.65)";
+
+            ctx.lineWidth = 1;
+
+            ctx.stroke();
+        }
+
+
+        /*
+            Small anchor joint.
+        */
+        ctx.beginPath();
+
+        ctx.arc(
+            anchor.x,
+            anchor.y,
+            2.5,
+            0,
+            TAU
+        );
+
+        ctx.fillStyle =
+            "rgba(175, 215, 235, 0.8)";
+
+        ctx.fill();
+    }
+}
+
+
+/* =========================================================
+   CREATURE INSTANCE
+========================================================= */
+
+const creature = new Creature();
+
+
+/* =========================================================
+   BACKGROUND
+========================================================= */
+
+function drawBackground() {
+
+    ctx.fillStyle = "#07090d";
+
+    ctx.fillRect(
+        0,
+        0,
+        W,
+        H
+    );
+
+
+    /*
+        Very subtle grid/noise-like dots.
+        Keeps the minimalist sci-fi appearance.
+    */
+    ctx.globalAlpha = 0.13;
+
+    ctx.fillStyle = "#6c8495";
+
+    const spacing = 45;
+
+    for (
+        let x = 0;
+        x < W;
+        x += spacing
+    ) {
+
+        for (
+            let y = 0;
+            y < H;
+            y += spacing
+        ) {
+
+            ctx.fillRect(
+                x,
+                y,
+                1,
+                1
+            );
+        }
+    }
+
+    ctx.globalAlpha = 1;
+}
+
+
+/* =========================================================
+   CURSOR
+========================================================= */
+
+function drawCursorTarget() {
+
+    if (!mouse.active)
+        return;
+
+    const r =
+        5 +
+        Math.sin(
+            creature.time * 4
+        ) * 1.5;
+
+    ctx.beginPath();
+
+    ctx.arc(
+        mouse.x,
+        mouse.y,
+        r,
+        0,
+        TAU
+    );
+
+    ctx.strokeStyle =
+        "rgba(120, 200, 255, 0.35)";
+
+    ctx.lineWidth = 1;
+
+    ctx.stroke();
+
+
+    ctx.beginPath();
+
+    ctx.moveTo(
+        mouse.x - 10,
+        mouse.y
+    );
+
+    ctx.lineTo(
+        mouse.x + 10,
+        mouse.y
+    );
+
+    ctx.moveTo(
+        mouse.x,
+        mouse.y - 10
+    );
+
+    ctx.lineTo(
+        mouse.x,
+        mouse.y + 10
+    );
+
+    ctx.strokeStyle =
+        "rgba(120, 200, 255, 0.16)";
+
+    ctx.stroke();
+}
+
+
+/* =========================================================
+   ANIMATION LOOP
+========================================================= */
+
+let lastTime = performance.now();
+
+function animate(now) {
+
+    const dt =
+        Math.min(
+            (now - lastTime) / 1000,
+            0.033
+        );
+
+    lastTime = now;
+
+
+    drawBackground();
+
+    creature.update(dt);
+
+    creature.draw();
+
+    drawCursorTarget();
+
+
+    requestAnimationFrame(animate);
+}
+
+requestAnimationFrame(animate);
+
+</script>
+
+</body>
+</html>
